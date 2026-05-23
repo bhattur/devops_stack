@@ -19,6 +19,8 @@ SONARQUBE_URL="${SONARQUBE_URL:-https://binaries.sonarsource.com/Distribution/so
 K8S_VERSION_MINOR="${K8S_VERSION_MINOR:-v1.36}"
 INIT_K8S="${INIT_K8S:-false}"
 POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
+OS_ID=""
+OS_VERSION_ID=""
 
 log() {
   printf '\n[INFO] %s\n' "$*"
@@ -33,6 +35,23 @@ die() {
   exit 1
 }
 
+detect_os() {
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    OS_ID="${ID:-}"
+    OS_VERSION_ID="${VERSION_ID:-}"
+  fi
+}
+
+is_amazon_linux() {
+  [[ "${OS_ID}" == "amzn" ]]
+}
+
+is_amazon_linux_2023() {
+  [[ "${OS_ID}" == "amzn" && "${OS_VERSION_ID}" == 2023* ]]
+}
+
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     die "Please run as root: sudo bash $0"
@@ -41,6 +60,10 @@ require_root() {
 
 require_dnf() {
   command -v dnf >/dev/null 2>&1 || die "This script requires dnf and is intended for Oracle Linux/RHEL-like systems."
+
+  if is_amazon_linux && ! is_amazon_linux_2023; then
+    die "Amazon Linux ${OS_VERSION_ID:-unknown} is not supported by this script. Use Amazon Linux 2023, Oracle Linux, RHEL, Rocky, or AlmaLinux."
+  fi
 }
 
 pkg_install() {
@@ -91,6 +114,17 @@ open_firewall_ports() {
 install_base_packages() {
   log "Installing base packages, Python, Git, Java, and useful tools"
   dnf makecache -y
+
+  if is_amazon_linux_2023; then
+    pkg_install dnf-plugins-core curl ca-certificates gnupg2 tar unzip git python3 python3-pip
+
+    if ! pkg_install java-21-amazon-corretto-devel; then
+      warn "Amazon Corretto 21 install failed; trying Corretto 17."
+      pkg_install java-17-amazon-corretto-devel
+    fi
+    return
+  fi
+
   pkg_install dnf-plugins-core curl ca-certificates gnupg2 yum-utils tar unzip git python3 python3-pip
 
   if ! pkg_install java-21-openjdk java-21-openjdk-devel; then
@@ -101,6 +135,21 @@ install_base_packages() {
 
 install_ansible() {
   log "Installing Ansible"
+
+  if is_amazon_linux_2023; then
+    if dnf install -y ansible; then
+      :
+    elif dnf install -y ansible-core; then
+      warn "The full Ansible community package is not available from DNF; using ansible-core from the OS repositories."
+    else
+      warn "DNF Ansible install failed; installing Ansible with pip."
+      python3 -m pip install --upgrade pip
+      python3 -m pip install --ignore-installed ansible
+    fi
+
+    warn "Ansible is a command-line tool, not a long-running service, so there is no Ansible daemon to enable at boot."
+    return
+  fi
 
   if dnf install -y oracle-epel-release-el10 || dnf install -y oracle-epel-release-el9 || dnf install -y epel-release; then
     dnf makecache -y || true
@@ -124,6 +173,26 @@ install_ansible() {
 install_docker() {
   log "Installing Docker Engine"
   dnf remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine podman-docker runc || true
+
+  if is_amazon_linux_2023; then
+    pkg_install docker
+    mkdir -p /etc/docker
+
+    cat >/etc/docker/daemon.json <<'EOF'
+{
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m"
+  },
+  "storage-driver": "overlay2"
+}
+EOF
+
+    enable_service docker
+    warn "Docker Compose plugin availability varies on Amazon Linux 2023; install it separately if your workflow needs docker compose."
+    return
+  fi
 
   if dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo; then
     :
@@ -321,7 +390,14 @@ EOF
 
 install_postgresql() {
   log "Installing PostgreSQL and enabling it at boot"
-  pkg_install postgresql-server postgresql-contrib
+
+  if is_amazon_linux_2023; then
+    if ! pkg_install postgresql16-server postgresql16-contrib; then
+      pkg_install postgresql-server postgresql-contrib
+    fi
+  else
+    pkg_install postgresql-server postgresql-contrib
+  fi
 
   if [[ ! -s /var/lib/pgsql/data/PG_VERSION ]]; then
     postgresql-setup --initdb
@@ -334,6 +410,11 @@ install_postgresql() {
 
 install_kubernetes() {
   log "Installing Kubernetes kubelet, kubeadm, and kubectl"
+  if is_amazon_linux_2023; then
+    warn "Kubernetes kubeadm packages are not installed on Amazon Linux 2023 by this script. Use an EKS-optimized AMI, EKS, or add an Amazon Linux-specific Kubernetes repo after validating compatibility."
+    return
+  fi
+
   swapoff -a || true
   sed -ri.bak '/\sswap\s/s/^#?/#/' /etc/fstab
 
@@ -378,7 +459,14 @@ EOF
 
 print_summary() {
   local ip_address
+  local kubernetes_summary
   ip_address="$(hostname -I 2>/dev/null | awk '{print $1}')"
+
+  if is_amazon_linux_2023; then
+    kubernetes_summary="Kubernetes kubelet/kubeadm/kubectl skipped on Amazon Linux 2023"
+  else
+    kubernetes_summary="Kubernetes kubelet/kubeadm/kubectl, kubelet enabled at boot"
+  fi
 
   cat <<EOF
 
@@ -394,7 +482,7 @@ Installed:
   - SonarQube, native systemd service enabled
   - Elastic Stack: Elasticsearch, Logstash, and Kibana enabled at boot
   - PostgreSQL, enabled at boot
-  - Kubernetes kubelet/kubeadm/kubectl, kubelet enabled at boot
+  - ${kubernetes_summary}
 
 Access URLs:
   - Jenkins:   http://${ip_address:-SERVER_IP}:${JENKINS_PORT}
@@ -419,6 +507,7 @@ EOF
 
 main() {
   require_root
+  detect_os
   require_dnf
   install_base_packages
   install_ansible
