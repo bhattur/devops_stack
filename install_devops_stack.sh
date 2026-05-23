@@ -7,6 +7,10 @@ set -Eeuo pipefail
 JENKINS_PORT="${JENKINS_PORT:-8080}"
 NEXUS_PORT="${NEXUS_PORT:-8081}"
 SONARQUBE_PORT="${SONARQUBE_PORT:-9000}"
+ELASTICSEARCH_PORT="${ELASTICSEARCH_PORT:-9200}"
+KIBANA_PORT="${KIBANA_PORT:-5601}"
+LOGSTASH_BEATS_PORT="${LOGSTASH_BEATS_PORT:-5044}"
+ELASTIC_STACK_MAJOR="${ELASTIC_STACK_MAJOR:-9.x}"
 NEXUS_VERSION="${NEXUS_VERSION:-3.92.2-01}"
 SONARQUBE_VERSION="${SONARQUBE_VERSION:-26.5.0.122743}"
 NEXUS_URL="${NEXUS_URL:-https://download.sonatype.com/nexus/3/nexus-${NEXUS_VERSION}-linux-x86_64.tar.gz}"
@@ -73,6 +77,9 @@ open_firewall_ports() {
   firewall-cmd --permanent --add-port="${JENKINS_PORT}/tcp"
   firewall-cmd --permanent --add-port="${NEXUS_PORT}/tcp"
   firewall-cmd --permanent --add-port="${SONARQUBE_PORT}/tcp"
+  firewall-cmd --permanent --add-port="${ELASTICSEARCH_PORT}/tcp"
+  firewall-cmd --permanent --add-port="${KIBANA_PORT}/tcp"
+  firewall-cmd --permanent --add-port="${LOGSTASH_BEATS_PORT}/tcp"
   firewall-cmd --permanent --add-port=6443/tcp
   firewall-cmd --permanent --add-port=10250/tcp
   firewall-cmd --permanent --add-port=30000-32767/tcp
@@ -254,6 +261,58 @@ EOF
   enable_service sonarqube.service
 }
 
+install_elk_stack() {
+  log "Installing Elastic Stack ${ELASTIC_STACK_MAJOR}: Elasticsearch, Logstash, and Kibana"
+  rpm --import https://artifacts.elastic.co/GPG-KEY-elasticsearch
+
+  cat >/etc/yum.repos.d/elastic.repo <<EOF
+[elastic-${ELASTIC_STACK_MAJOR}]
+name=Elastic repository for ${ELASTIC_STACK_MAJOR} packages
+baseurl=https://artifacts.elastic.co/packages/${ELASTIC_STACK_MAJOR}/yum
+gpgcheck=1
+gpgkey=https://artifacts.elastic.co/GPG-KEY-elasticsearch
+enabled=1
+autorefresh=1
+type=rpm-md
+EOF
+
+  pkg_install elasticsearch logstash kibana
+
+  sysctl -w vm.max_map_count=1048576
+  cat >/etc/sysctl.d/98-elastic-stack.conf <<'EOF'
+vm.max_map_count=1048576
+EOF
+
+  sed -i 's/^#\?cluster.name:.*/cluster.name: devops-stack/' /etc/elasticsearch/elasticsearch.yml
+  sed -i 's/^#\?node.name:.*/node.name: devops-stack-node-1/' /etc/elasticsearch/elasticsearch.yml
+  grep -q '^discovery.type:' /etc/elasticsearch/elasticsearch.yml || cat >>/etc/elasticsearch/elasticsearch.yml <<'EOF'
+discovery.type: single-node
+EOF
+
+  sed -i 's/^#\?server.host:.*/server.host: "0.0.0.0"/' /etc/kibana/kibana.yml
+
+  cat >/etc/logstash/conf.d/01-devops-stack.conf <<EOF
+input {
+  beats {
+    port => ${LOGSTASH_BEATS_PORT}
+  }
+}
+
+output {
+  stdout {
+    codec => rubydebug
+  }
+}
+EOF
+
+  systemctl daemon-reload
+  enable_service elasticsearch.service
+  enable_service kibana.service
+  enable_service logstash.service
+
+  warn "Elasticsearch security is enabled by default. Use elasticsearch-reset-password and elasticsearch-create-enrollment-token to finish Kibana setup."
+}
+
 install_kubernetes() {
   log "Installing Kubernetes kubelet, kubeadm, and kubectl"
   swapoff -a || true
@@ -314,18 +373,23 @@ Installed:
   - Jenkins, enabled at boot
   - Nexus Repository, native systemd service enabled
   - SonarQube, native systemd service enabled
+  - Elastic Stack: Elasticsearch, Logstash, and Kibana enabled at boot
   - Kubernetes kubelet/kubeadm/kubectl, kubelet enabled at boot
 
 Access URLs:
   - Jenkins:   http://${ip_address:-SERVER_IP}:${JENKINS_PORT}
   - Nexus:     http://${ip_address:-SERVER_IP}:${NEXUS_PORT}
   - SonarQube: http://${ip_address:-SERVER_IP}:${SONARQUBE_PORT}
+  - Kibana:    http://${ip_address:-SERVER_IP}:${KIBANA_PORT}
+  - Elasticsearch: https://${ip_address:-SERVER_IP}:${ELASTICSEARCH_PORT}
 
 Useful commands:
   - Jenkins initial password: sudo cat /var/lib/jenkins/secrets/initialAdminPassword
   - Nexus initial password:   sudo cat /opt/sonatype-work/nexus3/admin.password
   - SonarQube default login:  admin / admin
-  - Check native services:    sudo systemctl status nexus sonarqube
+  - Reset Elastic password:   sudo /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic
+  - Create Kibana token:      sudo /usr/share/elasticsearch/bin/elasticsearch-create-enrollment-token -s kibana
+  - Check native services:    sudo systemctl status nexus sonarqube elasticsearch kibana logstash
   - Check Kubernetes:         sudo systemctl status kubelet
 
 EOF
@@ -340,6 +404,7 @@ main() {
   install_jenkins
   install_nexus_native
   install_sonarqube_native
+  install_elk_stack
   install_kubernetes
   open_firewall_ports
   print_summary
