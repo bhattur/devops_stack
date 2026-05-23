@@ -10,6 +10,7 @@ SONARQUBE_PORT="${SONARQUBE_PORT:-9000}"
 ELASTICSEARCH_PORT="${ELASTICSEARCH_PORT:-9200}"
 KIBANA_PORT="${KIBANA_PORT:-5601}"
 LOGSTASH_BEATS_PORT="${LOGSTASH_BEATS_PORT:-5044}"
+POSTGRESQL_PORT="${POSTGRESQL_PORT:-5432}"
 ELASTIC_STACK_MAJOR="${ELASTIC_STACK_MAJOR:-9.x}"
 NEXUS_VERSION="${NEXUS_VERSION:-3.92.2-01}"
 SONARQUBE_VERSION="${SONARQUBE_VERSION:-26.5.0.122743}"
@@ -80,6 +81,7 @@ open_firewall_ports() {
   firewall-cmd --permanent --add-port="${ELASTICSEARCH_PORT}/tcp"
   firewall-cmd --permanent --add-port="${KIBANA_PORT}/tcp"
   firewall-cmd --permanent --add-port="${LOGSTASH_BEATS_PORT}/tcp"
+  firewall-cmd --permanent --add-port="${POSTGRESQL_PORT}/tcp"
   firewall-cmd --permanent --add-port=6443/tcp
   firewall-cmd --permanent --add-port=10250/tcp
   firewall-cmd --permanent --add-port=30000-32767/tcp
@@ -317,6 +319,19 @@ EOF
   warn "Elasticsearch security is enabled by default. Use elasticsearch-reset-password and elasticsearch-create-enrollment-token to finish Kibana setup."
 }
 
+install_postgresql() {
+  log "Installing PostgreSQL and enabling it at boot"
+  pkg_install postgresql-server postgresql-contrib
+
+  if [[ ! -s /var/lib/pgsql/data/PG_VERSION ]]; then
+    postgresql-setup --initdb
+  else
+    warn "PostgreSQL data directory is already initialized; skipping initdb."
+  fi
+
+  enable_service postgresql.service
+}
+
 install_kubernetes() {
   log "Installing Kubernetes kubelet, kubeadm, and kubectl"
   swapoff -a || true
@@ -378,6 +393,7 @@ Installed:
   - Nexus Repository, native systemd service enabled
   - SonarQube, native systemd service enabled
   - Elastic Stack: Elasticsearch, Logstash, and Kibana enabled at boot
+  - PostgreSQL, enabled at boot
   - Kubernetes kubelet/kubeadm/kubectl, kubelet enabled at boot
 
 Access URLs:
@@ -386,6 +402,7 @@ Access URLs:
   - SonarQube: http://${ip_address:-SERVER_IP}:${SONARQUBE_PORT}
   - Kibana:    http://${ip_address:-SERVER_IP}:${KIBANA_PORT}
   - Elasticsearch: https://${ip_address:-SERVER_IP}:${ELASTICSEARCH_PORT}
+  - PostgreSQL: ${ip_address:-SERVER_IP}:${POSTGRESQL_PORT}
 
 Useful commands:
   - Jenkins initial password: sudo cat /var/lib/jenkins/secrets/initialAdminPassword
@@ -393,7 +410,8 @@ Useful commands:
   - SonarQube default login:  admin / admin
   - Reset Elastic password:   sudo /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic
   - Create Kibana token:      sudo /usr/share/elasticsearch/bin/elasticsearch-create-enrollment-token -s kibana
-  - Check native services:    sudo systemctl status nexus sonarqube elasticsearch kibana logstash
+  - PostgreSQL shell:         sudo -iu postgres psql
+  - Check native services:    sudo systemctl status nexus sonarqube elasticsearch kibana logstash postgresql
   - Check Kubernetes:         sudo systemctl status kubelet
 
 EOF
@@ -409,6 +427,7 @@ main() {
   install_nexus_native
   install_sonarqube_native
   install_elk_stack
+  install_postgresql
   install_kubernetes
   open_firewall_ports
   print_summary
