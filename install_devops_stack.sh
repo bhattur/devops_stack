@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# DevOps stack installer for Oracle Linux / RHEL-like systems.
+# DevOps stack installer for RHEL-like, Debian/Ubuntu, and Amazon Linux 2023 systems.
 # Run with: sudo bash install_devops_stack.sh
 
 JENKINS_PORT="${JENKINS_PORT:-8080}"
@@ -20,7 +20,10 @@ K8S_VERSION_MINOR="${K8S_VERSION_MINOR:-v1.36}"
 INIT_K8S="${INIT_K8S:-false}"
 POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
 OS_ID=""
+OS_ID_LIKE=""
+OS_CODENAME=""
 OS_VERSION_ID=""
+PKG_MANAGER=""
 
 log() {
   printf '\n[INFO] %s\n' "$*"
@@ -40,6 +43,8 @@ detect_os() {
     # shellcheck disable=SC1091
     source /etc/os-release
     OS_ID="${ID:-}"
+    OS_ID_LIKE="${ID_LIKE:-}"
+    OS_CODENAME="${VERSION_CODENAME:-}"
     OS_VERSION_ID="${VERSION_ID:-}"
   fi
 }
@@ -52,22 +57,71 @@ is_amazon_linux_2023() {
   [[ "${OS_ID}" == "amzn" && "${OS_VERSION_ID}" == 2023* ]]
 }
 
+is_debian_family() {
+  [[ "${OS_ID}" == "debian" || "${OS_ID}" == "ubuntu" || " ${OS_ID_LIKE} " == *" debian "* ]]
+}
+
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     die "Please run as root: sudo bash $0"
   fi
 }
 
-require_dnf() {
-  command -v dnf >/dev/null 2>&1 || die "This script requires dnf and is intended for Oracle Linux/RHEL-like systems."
+require_package_manager() {
+  if command -v dnf >/dev/null 2>&1; then
+    PKG_MANAGER="dnf"
+  elif command -v apt-get >/dev/null 2>&1; then
+    PKG_MANAGER="apt"
+  else
+    die "This script requires dnf or apt-get."
+  fi
 
   if is_amazon_linux && ! is_amazon_linux_2023; then
-    die "Amazon Linux ${OS_VERSION_ID:-unknown} is not supported by this script. Use Amazon Linux 2023, Oracle Linux, RHEL, Rocky, or AlmaLinux."
+    die "Amazon Linux ${OS_VERSION_ID:-unknown} is not supported by this script. Use Amazon Linux 2023, Oracle Linux, RHEL, Rocky, AlmaLinux, Debian, or Ubuntu."
+  fi
+
+  if [[ "${PKG_MANAGER}" == "apt" ]] && ! is_debian_family; then
+    die "apt-get was found, but this OS is not recognized as Debian/Ubuntu-compatible."
   fi
 }
 
 pkg_install() {
-  dnf install -y "$@"
+  if [[ "${PKG_MANAGER}" == "apt" ]]; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+  else
+    dnf install -y "$@"
+  fi
+}
+
+pkg_update() {
+  if [[ "${PKG_MANAGER}" == "apt" ]]; then
+    DEBIAN_FRONTEND=noninteractive apt-get update
+  else
+    dnf makecache -y
+  fi
+}
+
+pkg_clean() {
+  if [[ "${PKG_MANAGER}" == "apt" ]]; then
+    apt-get clean
+  else
+    dnf clean packages
+  fi
+}
+
+apt_install_prereqs() {
+  pkg_install ca-certificates curl gnupg lsb-release
+  install -m 0755 -d /etc/apt/keyrings
+}
+
+get_apt_codename() {
+  if [[ -n "${OS_CODENAME}" ]]; then
+    printf '%s\n' "${OS_CODENAME}"
+  elif command -v lsb_release >/dev/null 2>&1; then
+    lsb_release -cs
+  else
+    die "Could not detect Debian/Ubuntu codename for apt repository setup."
+  fi
 }
 
 enable_service() {
@@ -113,7 +167,17 @@ open_firewall_ports() {
 
 install_base_packages() {
   log "Installing base packages, Python, Git, Java, and useful tools"
-  dnf makecache -y
+  pkg_update
+
+  if [[ "${PKG_MANAGER}" == "apt" ]]; then
+    pkg_install ca-certificates curl gnupg lsb-release tar unzip git python3 python3-pip
+
+    if ! pkg_install openjdk-21-jdk; then
+      warn "OpenJDK 21 install failed; trying OpenJDK 17."
+      pkg_install openjdk-17-jdk
+    fi
+    return
+  fi
 
   if is_amazon_linux_2023; then
     pkg_install dnf-plugins-core curl ca-certificates gnupg2 tar unzip git python3 python3-pip
@@ -135,6 +199,21 @@ install_base_packages() {
 
 install_ansible() {
   log "Installing Ansible"
+
+  if [[ "${PKG_MANAGER}" == "apt" ]]; then
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y ansible; then
+      :
+    elif DEBIAN_FRONTEND=noninteractive apt-get install -y ansible-core; then
+      warn "The full Ansible community package is not available from apt; using ansible-core from the OS repositories."
+    else
+      warn "apt Ansible install failed; installing Ansible with pip."
+      python3 -m pip install --upgrade pip --break-system-packages || python3 -m pip install --upgrade pip
+      python3 -m pip install --ignore-installed ansible --break-system-packages || python3 -m pip install --ignore-installed ansible
+    fi
+
+    warn "Ansible is a command-line tool, not a long-running service, so there is no Ansible daemon to enable at boot."
+    return
+  fi
 
   if is_amazon_linux_2023; then
     if dnf install -y ansible; then
@@ -172,6 +251,46 @@ install_ansible() {
 
 install_docker() {
   log "Installing Docker Engine"
+  if [[ "${PKG_MANAGER}" == "apt" ]]; then
+    apt-get remove -y docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc || true
+    apt_install_prereqs
+
+    local docker_os_id="${OS_ID}"
+    local apt_codename
+    apt_codename="$(get_apt_codename)"
+
+    if [[ "${docker_os_id}" != "debian" && "${docker_os_id}" != "ubuntu" ]]; then
+      docker_os_id="debian"
+      warn "Using Docker's Debian apt repository for Debian-like distribution ${OS_ID}."
+    fi
+
+    curl -fsSL "https://download.docker.com/linux/${docker_os_id}/gpg" -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+    cat >/etc/apt/sources.list.d/docker.list <<EOF
+deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${docker_os_id} ${apt_codename} stable
+EOF
+    pkg_update
+    pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    mkdir -p /etc/docker /etc/containerd
+
+    cat >/etc/docker/daemon.json <<'EOF'
+{
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m"
+  },
+  "storage-driver": "overlay2"
+}
+EOF
+
+    containerd config default >/etc/containerd/config.toml
+    sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+    enable_service containerd
+    enable_service docker
+    return
+  fi
+
   dnf remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine podman-docker runc || true
 
   if is_amazon_linux_2023; then
@@ -224,6 +343,25 @@ EOF
 
 install_jenkins() {
   log "Installing Jenkins and enabling it at boot"
+  if [[ "${PKG_MANAGER}" == "apt" ]]; then
+    apt_install_prereqs
+    curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key -o /etc/apt/keyrings/jenkins-keyring.asc
+    cat >/etc/apt/sources.list.d/jenkins.list <<'EOF'
+deb [signed-by=/etc/apt/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/
+EOF
+    pkg_update
+    pkg_install fontconfig jenkins
+    mkdir -p /etc/systemd/system/jenkins.service.d
+    cat >/etc/systemd/system/jenkins.service.d/override.conf <<EOF
+[Service]
+Environment="JENKINS_PORT=${JENKINS_PORT}"
+TimeoutStartSec=10min
+EOF
+    systemctl daemon-reload
+    enable_service jenkins
+    return
+  fi
+
   curl -fsSL https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key -o /etc/pki/rpm-gpg/jenkins.io-2023.key
   curl -fsSL https://pkg.jenkins.io/redhat-stable/jenkins.repo -o /etc/yum.repos.d/jenkins.repo
   rpm --import /etc/pki/rpm-gpg/jenkins.io-2023.key
@@ -334,9 +472,17 @@ EOF
 
 install_elk_stack() {
   log "Installing Elastic Stack ${ELASTIC_STACK_MAJOR}: Elasticsearch, Logstash, and Kibana"
-  rpm --import https://artifacts.elastic.co/GPG-KEY-elasticsearch
+  if [[ "${PKG_MANAGER}" == "apt" ]]; then
+    apt_install_prereqs
+    curl -fsSL https://artifacts.elastic.co/GPG-KEY-elasticsearch | gpg --dearmor --yes -o /etc/apt/keyrings/elasticsearch-keyring.gpg
+    cat >/etc/apt/sources.list.d/elastic-${ELASTIC_STACK_MAJOR}.list <<EOF
+deb [signed-by=/etc/apt/keyrings/elasticsearch-keyring.gpg] https://artifacts.elastic.co/packages/${ELASTIC_STACK_MAJOR}/apt stable main
+EOF
+    pkg_update
+  else
+    rpm --import https://artifacts.elastic.co/GPG-KEY-elasticsearch
 
-  cat >/etc/yum.repos.d/elastic.repo <<EOF
+    cat >/etc/yum.repos.d/elastic.repo <<EOF
 [elastic-${ELASTIC_STACK_MAJOR}]
 name=Elastic repository for ${ELASTIC_STACK_MAJOR} packages
 baseurl=https://artifacts.elastic.co/packages/${ELASTIC_STACK_MAJOR}/yum
@@ -346,10 +492,11 @@ enabled=1
 autorefresh=1
 type=rpm-md
 EOF
+  fi
 
   for package in elasticsearch kibana logstash; do
     pkg_install "${package}"
-    dnf clean packages
+    pkg_clean
   done
 
   sysctl -w vm.max_map_count=1048576
@@ -391,6 +538,12 @@ EOF
 install_postgresql() {
   log "Installing PostgreSQL and enabling it at boot"
 
+  if [[ "${PKG_MANAGER}" == "apt" ]]; then
+    pkg_install postgresql postgresql-contrib
+    enable_service postgresql.service
+    return
+  fi
+
   if is_amazon_linux_2023; then
     if ! pkg_install postgresql16-server postgresql16-contrib; then
       pkg_install postgresql-server postgresql-contrib
@@ -412,6 +565,48 @@ install_kubernetes() {
   log "Installing Kubernetes kubelet, kubeadm, and kubectl"
   if is_amazon_linux_2023; then
     warn "Kubernetes kubeadm packages are not installed on Amazon Linux 2023 by this script. Use an EKS-optimized AMI, EKS, or add an Amazon Linux-specific Kubernetes repo after validating compatibility."
+    return
+  fi
+
+  if [[ "${PKG_MANAGER}" == "apt" ]]; then
+    swapoff -a || true
+    sed -ri.bak '/\sswap\s/s/^#?/#/' /etc/fstab
+
+    cat >/etc/modules-load.d/k8s.conf <<'EOF'
+overlay
+br_netfilter
+EOF
+    modprobe overlay || true
+    modprobe br_netfilter || true
+
+    cat >/etc/sysctl.d/99-kubernetes-cri.conf <<'EOF'
+net.bridge.bridge-nf-call-iptables=1
+net.bridge.bridge-nf-call-ip6tables=1
+net.ipv4.ip_forward=1
+EOF
+    sysctl --system
+
+    apt_install_prereqs
+    curl -fsSL "https://pkgs.k8s.io/core:/stable:/${K8S_VERSION_MINOR}/deb/Release.key" | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    cat >/etc/apt/sources.list.d/kubernetes.list <<EOF
+deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${K8S_VERSION_MINOR}/deb/ /
+EOF
+
+    pkg_update
+    pkg_install kubelet kubeadm kubectl
+    apt-mark hold kubelet kubeadm kubectl
+    enable_service kubelet
+
+    if [[ "${INIT_K8S}" == "true" ]]; then
+      log "Initializing a single-node Kubernetes control plane"
+      kubeadm init --pod-network-cidr="${POD_CIDR}" --cri-socket=unix:///run/containerd/containerd.sock
+      mkdir -p /root/.kube
+      cp -f /etc/kubernetes/admin.conf /root/.kube/config
+      chown root:root /root/.kube/config
+      kubectl --kubeconfig=/etc/kubernetes/admin.conf taint nodes --all node-role.kubernetes.io/control-plane- || true
+    else
+      warn "Kubernetes tools are installed and kubelet is enabled. Set INIT_K8S=true to also run kubeadm init."
+    fi
     return
   fi
 
@@ -508,7 +703,7 @@ EOF
 main() {
   require_root
   detect_os
-  require_dnf
+  require_package_manager
   install_base_packages
   install_ansible
   install_docker
