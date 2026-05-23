@@ -276,7 +276,10 @@ autorefresh=1
 type=rpm-md
 EOF
 
-  pkg_install elasticsearch logstash kibana
+  for package in elasticsearch kibana logstash; do
+    pkg_install "${package}"
+    dnf clean packages
+  done
 
   sysctl -w vm.max_map_count=1048576
   cat >/etc/sysctl.d/98-elastic-stack.conf <<'EOF'
