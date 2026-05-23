@@ -288,6 +288,7 @@ EOF
 
   sed -i 's/^#\?cluster.name:.*/cluster.name: devops-stack/' /etc/elasticsearch/elasticsearch.yml
   sed -i 's/^#\?node.name:.*/node.name: devops-stack-node-1/' /etc/elasticsearch/elasticsearch.yml
+  sed -i 's/^cluster.initial_master_nodes:/#cluster.initial_master_nodes:/' /etc/elasticsearch/elasticsearch.yml
   grep -q '^discovery.type:' /etc/elasticsearch/elasticsearch.yml || cat >>/etc/elasticsearch/elasticsearch.yml <<'EOF'
 discovery.type: single-node
 EOF
